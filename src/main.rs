@@ -1,6 +1,11 @@
-mod sudoku;
-
+// mod sudoku;
+// mod process;
+// mod flow;
+// mod sqlopt;
+// mod color_paint;
+// mod test_nom;
+// mod img;
+mod audio;
 fn main() {
-    println!("Hello, world!,{}",5/3);
-    sudoku::run();
+     
 }
