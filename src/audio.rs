@@ -1,233 +1,185 @@
-use std::fs::File;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::thread;
+extern crate ffmpeg_next as ffmpeg;
+
+use cpal::{Sample, SampleFormat};
+use ffmpeg::format::sample::Type as SampleType;
+use ffmpeg::format::{Sample as FFmpegSample, input};
+use ffmpeg::frame;
+use ffmpeg::media::Type as MediaType;
+use ffmpeg::software::resampling::{context::Context as ResamplingContext};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use ringbuf::traits::consumer::Consumer;
+use ringbuf::SharedRb;
+use ringbuf::traits::Split;
+use ffmpeg_next:: codec::  Context as CodecContext;
+use ringbuf::storage::Heap;
 use std::time::Duration;
+use ringbuf::traits::Producer;
+use ringbuf::traits::Observer;
+use ringbuf::Arc;
+use ringbuf::wrap::caching::Caching;
 
-use crossbeam_channel::{bounded, Receiver, Sender};
-use log::{error, info, warn};
-use mp4::{Mp4Reader, TrackType};
-use ringbuf::RingBuffer;
- 
- 
-
-type AudioFrame = Vec<u8>;
-
-struct AudioStreamConfig {
-    file_path: PathBuf,
-    buffer_size: usize,
-    sample_rate: u32,
-    channels: u16,
+trait SampleFormatConversion {
+    fn as_ffmpeg_sample(&self) -> FFmpegSample;
 }
 
-struct AudioStream {
-    producer_thread: thread::JoinHandle<()>,
-    consumer_thread: thread::JoinHandle<()>,
-    ctrl_sender: Sender<()>,
+impl SampleFormatConversion for SampleFormat {
+    fn as_ffmpeg_sample(&self) -> FFmpegSample {
+        match self {
+            Self::I16 => FFmpegSample::I16(SampleType::Packed),
+            Self::U16 => {
+                panic!("ffmpeg resampler doesn't support u16")
+            }, 
+            Self::F32 => FFmpegSample::F32(SampleType::Packed),
+            Self::U8|Self::I8 => FFmpegSample::U8(SampleType::Packed),
+             _ =>{FFmpegSample::F32(SampleType::Packed)}
+        }
+    }
 }
 
-impl AudioStream {
-    pub fn start(
-        file_path: impl AsRef<Path>,
-        buffer_size: usize,
-        frame_handler: impl Fn(AudioFrame) + Send + 'static,
-    ) -> Result<Self, AudioStreamError> {
-        // 初始化日志
-        simplelog::TermLogger::init(
-            simplelog::LevelFilter::Info,
-            simplelog::Config::default(),
-            simplelog::TerminalMode::Mixed,
-            simplelog::ColorChoice::Auto,
-        )?;
+fn write_audio<T: Sample>(data: &mut [T], samples: &mut Caching<Arc<SharedRb<Heap<T>>>, false, true>, _: &cpal::OutputCallbackInfo) {
+    for d in data {
+        // copy as many samples as we have.
+        // if we run out, write silence
+        match samples.try_pop(){
+            Some(sample) => *d = sample,
+            None => *d =  Sample::EQUILIBRIUM
+        }
+    }
+}
 
-        let file_path = file_path.as_ref().to_path_buf();
+fn init_cpal() -> (cpal::Device, cpal::SupportedStreamConfig) {
+    let device = cpal::default_host()
+        .default_output_device()
+        .expect("no output device available");
+
+    // Create an output stream for the audio so we can play it
+    // NOTE: If system doesn't support the file's sample rate, the program will panic when we try to play,
+    //       so we'll need to resample the audio to a supported config
+    let supported_config_range = device.supported_output_configs()
+        .expect("error querying audio output configs")
+        .next()
+        .expect("no supported audio config found");
+
+    // Pick the best (highest) sample rate
+    (device, supported_config_range.with_max_sample_rate())
+}
+
+// Interpret the audio frame's data as packed (alternating channels, 12121212, as opposed to planar 11112222)
+pub fn packed<T: frame::audio::Sample>(frame: &frame::Audio) -> &[T] {
+    if !frame.is_packed() {
+        panic!("data is not packed");
+    }
+
+    if !<T as frame::audio::Sample>::is_valid(frame.format(), frame.channels()) {
+        panic!("unsupported type");
+    }
+
+    unsafe { std::slice::from_raw_parts((*frame.as_ptr()).data[0] as *const T, frame.samples() * frame.channels() as usize) }
+}
+
+pub fn play_mp4(file:&String) -> Result<(), ffmpeg::Error> {
+    ffmpeg::init().unwrap();
+    // Initialize cpal for playing audio
+    let (device, stream_config) = init_cpal();
+
+    // Open the file
+    let mut ictx = input(&file)?;
+
+    // Find the audio stream and its index
+    let audio = ictx
+        .streams()
+        .best(MediaType::Audio)
+        .ok_or(ffmpeg::Error::StreamNotFound)?;
+    let audio_stream_index = audio.index();
+
+
+    let audio_stream = ictx.stream(audio_stream_index).unwrap();
+    let audio_codec_ctx = CodecContext::from_parameters(audio_stream.parameters()).unwrap();
+    let mut audio_decoder = audio_codec_ctx.decoder().audio()?;
+    // Create a decoder
+
+    // Set up a resampler for the audio
+    let mut resampler = ResamplingContext::get(
+        audio_decoder.format(),
+        audio_decoder.channel_layout(),
+        audio_decoder.rate(),
         
-        // 创建环形缓冲区和控制通道
-        let rb = RingBuffer::new(buffer_size);
-        let (mut producer, mut consumer) = rb.split();
-        let (ctrl_sender, ctrl_receiver) = bounded(1);
+        stream_config.sample_format().as_ffmpeg_sample(),
+        audio_decoder.channel_layout(),
+        stream_config.sample_rate().0
+    )?;
 
-        // 读取MP4文件并获取配置
-        let config = Self::read_config(&file_path)?;
-        info!("Audio stream config: {:?}", config);
+    // A buffer to hold audio samples
+    let buffer = SharedRb::<Heap<_>>::new(8192);
+    let (mut producer, mut consumer) = buffer.split();
+    
+    // Set up the audio output stream
+    let audio_stream = match stream_config.sample_format() {
+        // SampleFormat::F32 => device.build_output_stream(&stream_config.into(), move |data: &mut [f32], cbinfo| {
+        //     // Copy to the audio buffer (if there aren't enough samples, write_audio will write silence)
+        //     write_audio(data, &mut consumer, &cbinfo)
+        // }, |err| {
+        //     eprintln!("error occurred on the audio output stream: {}", err)
+        // },
+        // Some(Duration::from_millis(1))   ),
+        SampleFormat::I16 => panic!("i16 output format unimplemented"),
+        SampleFormat::U16 => panic!("u16 output format unimplemented"),
+        SampleFormat::F64 => panic!("f64 output format unimplemented"),
+        SampleFormat::I8|SampleFormat::U8  => device.build_output_stream(&stream_config.into(), move |data: &mut [u8], cbinfo| {
+            // Copy to the audio buffer (if there aren't enough samples, write_audio will write silence)
+            write_audio(data, &mut consumer, &cbinfo)
+        }, |err| {
+            eprintln!("error occurred on the audio output stream: {}", err)
+        },
+         Some(Duration::from_millis(1))   ),
+        SampleFormat::I32 => panic!("I32 output format unimplemented"),
+        SampleFormat::I64 => panic!("I64 output format unimplemented"),
+        SampleFormat::U32 => panic!("U32 output format unimplemented"),
+        SampleFormat::U64 => panic!("U64 output format unimplemented"),
+        _  => panic!("unknown output format unimplemented"),
+     }.unwrap();
 
-        // 启动生产者线程
-        let producer_thread = Self::spawn_producer_thread(
-            file_path,
-            producer,
-            ctrl_receiver,
-        )?;
+    let mut receive_and_queue_audio_frames =
+        |decoder: &mut ffmpeg::decoder::Audio| -> Result<(), ffmpeg::Error> {
+            let mut decoded = frame::Audio::empty();
 
-        // 启动消费者线程
-        let consumer_thread = thread::spawn(move || {
-            info!("Consumer thread started");
-            while let Some(audio_frame) = consumer.pop() {
-                frame_handler(audio_frame);
+            // Ask the decoder for frames
+            while decoder.receive_frame(&mut decoded).is_ok() {
+                // Resample the frame's audio into another frame
+                let mut resampled = frame::Audio::empty();
+                resampler.run(&decoded, &mut resampled)?;
+
+                // DON'T just use resampled.data(0).len() -- it might not be fully populated
+                // Grab the right number of bytes based on sample count, bytes per sample, and number of channels.
+                let both_channels = packed(&resampled);
+
+                // Sleep until the buffer has enough space for all of the samples
+                // (the producer will happily accept a partial write, which we don't want)
+                while producer.vacant_len()< both_channels.len() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+
+                // Buffer the samples for playback
+                producer.push_slice(both_channels);
             }
-            info!("Consumer thread finished");
-        });
-
-        Ok(Self {
-            producer_thread,
-            consumer_thread,
-            ctrl_sender,
-        })
-    }
-
-    fn read_config(file_path: &Path) -> Result<AudioStreamConfig, AudioStreamError> {
-        let file = File::open(file_path)?;
-        let mp4 = Mp4Reader::read_header(file)?;
-
-        // 获取音频轨道信息
-        let audio_track = mp4
-            .tracks()
-            .values()
-            .find(|t| t.track_type() == TrackType::Audio)
-            .ok_or(AudioStreamError::NoAudioTrack)?;
-
-        let sample_rate = audio_track.timescale();
-        let channels = audio_track.channels().unwrap_or(2); // 默认为立体声
-
-        Ok(AudioStreamConfig {
-            file_path: file_path.to_path_buf(),
-            buffer_size: 100, // 默认值，可以在调用时覆盖
-            sample_rate,
-            channels,
-        })
-    }
-
-    fn spawn_producer_thread(
-        file_path: PathBuf,
-        mut producer: ringbuf::Producer<AudioFrame>,
-        ctrl_receiver: Receiver<()>,
-    ) -> Result<thread::JoinHandle<()>, AudioStreamError> {
-        let handle = thread::spawn(move || {
-            info!("Producer thread started for file: {:?}", file_path);
-            
-            let file = match File::open(&file_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    error!("Failed to open file: {}", e);
-                    return;
-                }
-            };
-
-            let mp4 = match Mp4Reader::read_header(file) {
-                Ok(m) => m,
-                Err(e) => {
-                    error!("Failed to read MP4 header: {}", e);
-                    return;
-                }
-            };
-
-            let audio_track = match mp4
-                .tracks()
-                .values()
-                .find(|t| t.track_type() == TrackType::Audio)
-            {
-                Some(t) => t,
-                None => {
-                    error!("No audio track found");
-                    return;
-                }
-            };
-
-            let mut samples = match mp4.read_samples(audio_track.track_id()) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("Failed to read samples: {}", e);
-                    return;
-                }
-            };
-
-            'producer_loop: loop {
-                // 检查是否有停止信号
-                if ctrl_receiver.try_recv().is_ok() {
-                    info!("Producer received stop signal");
-                    break 'producer_loop;
-                }
-
-                match samples.next() {
-                    Ok(Some(sample)) => {
-                        if producer.push(sample.bytes).is_err() {
-                            warn!("Buffer full, dropping frame");
-                            continue;
-                        }
-                    }
-                    Ok(None) => {
-                        info!("No more audio frames to read");
-                        break 'producer_loop;
-                    }
-                    Err(e) => {
-                        error!("Error reading sample: {}", e);
-                        break 'producer_loop;
-                    }
-                }
-
-                // 稍微休息一下，避免占用太多CPU
-                thread::sleep(Duration::from_millis(1));
-            }
-            info!("Producer thread finished");
-        });
-
-        Ok(handle)
-    }
-
-    pub fn stop(self) -> Result<()> {
-        info!("Stopping audio stream...");
-        self.ctrl_sender.send(())?;
-        
-        self.producer_thread.join().map_err(|_| AudioStreamError::ThreadError)?;
-        self.consumer_thread.join().map_err(|_| AudioStreamError::ThreadError)?;
-        
-        info!("Audio stream stopped successfully");
-        Ok(())
-    }
-}
-
-fn main() -> Result<(), AudioStreamError> {
-    // 示例：处理音频帧的函数
-    let frame_handler = |frame: AudioFrame| {
-        // 这里可以添加实际的音频处理逻辑
-        println!("Processing frame of size: {}", frame.len());
-        // 模拟处理时间
-        thread::sleep(Duration::from_millis(5));
-    };
-
-    // 启动音频流
-    let audio_stream = AudioStream::start("audio.mp4", 100, frame_handler)?;
-    
-    // 主线程可以做其他事情...
-    thread::sleep(Duration::from_secs(5));
-    
-    // 停止音频流
-    audio_stream.stop()?;
-    
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-
-    #[test]
-    fn test_audio_stream() {
-        let frame_count = Arc::new(AtomicUsize::new(0));
-        let frame_count_clone = frame_count.clone();
-        
-        let frame_handler = move |_frame: AudioFrame| {
-            frame_count_clone.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         };
 
-        let audio_stream = AudioStream::start("test.mp4", 50, frame_handler)
-            .expect("Failed to start audio stream");
-        
-        thread::sleep(Duration::from_secs(2));
-        
-        audio_stream.stop().expect("Failed to stop audio stream");
-        
-        assert!(frame_count.load(Ordering::SeqCst) > 0);
+    // Start playing
+    audio_stream.play().unwrap();
+
+    // The main loop!
+    for (stream, packet) in ictx.packets() {
+        // Look for audio packets (ignore video and others)
+        if stream.index() == audio_stream_index {
+            // Send the packet to the decoder; it will combine them into frames.
+            // In practice though, 1 packet = 1 frame
+            audio_decoder.send_packet(&packet)?;
+
+            // Queue the audio for playback (and block if the queue is full)
+            receive_and_queue_audio_frames(&mut audio_decoder)?;
+        }
     }
+
+    Ok(())
 }
