@@ -115,13 +115,13 @@ pub fn play_mp4(file:&String) -> Result<(), ffmpeg::Error> {
     
     // Set up the audio output stream
     let audio_stream = match stream_config.sample_format() {
-        // SampleFormat::F32 => device.build_output_stream(&stream_config.into(), move |data: &mut [f32], cbinfo| {
-        //     // Copy to the audio buffer (if there aren't enough samples, write_audio will write silence)
-        //     write_audio(data, &mut consumer, &cbinfo)
-        // }, |err| {
-        //     eprintln!("error occurred on the audio output stream: {}", err)
-        // },
-        // Some(Duration::from_millis(1))   ),
+        SampleFormat::F32 => device.build_output_stream(&stream_config.into(), move |data: &mut [f32], cbinfo| {
+            // Copy to the audio buffer (if there aren't enough samples, write_audio will write silence)
+            write_audio(data, &mut consumer, &cbinfo)
+        }, |err| {
+            eprintln!("error occurred on the audio output stream: {}", err)
+        },
+        Some(Duration::from_millis(1))   ),
         SampleFormat::I16 => panic!("i16 output format unimplemented"),
         SampleFormat::U16 => panic!("u16 output format unimplemented"),
         SampleFormat::F64 => panic!("f64 output format unimplemented"),
