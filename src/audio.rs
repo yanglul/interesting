@@ -12,11 +12,13 @@ use ringbuf::SharedRb;
 use ringbuf::traits::Split;
 use ffmpeg_next:: codec::  Context as CodecContext;
 use ringbuf::storage::Heap;
+use core::f32;
 use std::time::Duration;
 use ringbuf::traits::Producer;
 use ringbuf::traits::Observer;
 use ringbuf::Arc;
 use ringbuf::wrap::caching::Caching;
+use cpal::BuildStreamError;
 
 trait SampleFormatConversion {
     fn as_ffmpeg_sample(&self) -> FFmpegSample;
@@ -25,13 +27,14 @@ trait SampleFormatConversion {
 impl SampleFormatConversion for SampleFormat {
     fn as_ffmpeg_sample(&self) -> FFmpegSample {
         match self {
-            Self::I16 => FFmpegSample::I16(SampleType::Packed),
-            Self::U16 => {
-                panic!("ffmpeg resampler doesn't support u16")
-            }, 
-            Self::F32 => FFmpegSample::F32(SampleType::Packed),
+            Self::I16|Self::U16=> FFmpegSample::I16(SampleType::Packed),
+             
+            Self::I32|Self::U32=> FFmpegSample::I32(SampleType::Packed),
             Self::U8|Self::I8 => FFmpegSample::U8(SampleType::Packed),
-             _ =>{FFmpegSample::F32(SampleType::Packed)}
+            Self::I64|Self::U64 => FFmpegSample::I64(SampleType::Packed),
+            Self::F32 => FFmpegSample::F32(SampleType::Packed),
+            Self::F64 => FFmpegSample::F64(SampleType::Packed),
+             _ =>{FFmpegSample::None}
         }
     }
 }
@@ -108,30 +111,17 @@ pub fn play_mp4(file:&String) -> Result<(), ffmpeg::Error> {
         audio_decoder.channel_layout(),
         stream_config.sample_rate().0
     )?;
-
     // A buffer to hold audio samples
     let buffer = SharedRb::<Heap<_>>::new(8192);
     let (mut producer, mut consumer) = buffer.split();
     
     // Set up the audio output stream
     let audio_stream = match stream_config.sample_format() {
-        SampleFormat::F32 => device.build_output_stream(&stream_config.into(), move |data: &mut [f32], cbinfo| {
-            // Copy to the audio buffer (if there aren't enough samples, write_audio will write silence)
-            write_audio(data, &mut consumer, &cbinfo)
-        }, |err| {
-            eprintln!("error occurred on the audio output stream: {}", err)
-        },
-        Some(Duration::from_millis(1))   ),
+        SampleFormat::F32 => build_output_stream::<f32>(&device,&stream_config.into(),consumer),
         SampleFormat::I16 => panic!("i16 output format unimplemented"),
         SampleFormat::U16 => panic!("u16 output format unimplemented"),
         SampleFormat::F64 => panic!("f64 output format unimplemented"),
-        SampleFormat::I8|SampleFormat::U8  => device.build_output_stream(&stream_config.into(), move |data: &mut [u8], cbinfo| {
-            // Copy to the audio buffer (if there aren't enough samples, write_audio will write silence)
-            write_audio(data, &mut consumer, &cbinfo)
-        }, |err| {
-            eprintln!("error occurred on the audio output stream: {}", err)
-        },
-         Some(Duration::from_millis(1))   ),
+        SampleFormat::I8|SampleFormat::U8  =>build_output_stream::<i8>(&device,&stream_config.into(),consumer),
         SampleFormat::I32 => panic!("I32 output format unimplemented"),
         SampleFormat::I64 => panic!("I64 output format unimplemented"),
         SampleFormat::U32 => panic!("U32 output format unimplemented"),
@@ -182,4 +172,20 @@ pub fn play_mp4(file:&String) -> Result<(), ffmpeg::Error> {
     }
 
     Ok(())
+}
+
+
+pub fn build_output_stream<T>(device:&cpal::Device,stream_config:&cpal::StreamConfig,mut consumer:Caching<Arc<SharedRb<Heap<f32>>>, false, true>)-> Result<cpal::Stream, BuildStreamError>
+where 
+    T: cpal::Sample{
+    
+        device.build_output_stream(stream_config.into(), move |data: &mut [f32], cbinfo| {
+            // Copy to the audio buffer (if there aren't enough samples, write_audio will write silence)
+            write_audio(data, &mut consumer, &cbinfo)
+        }, |err| {
+            eprintln!("error occurred on the audio output stream: {}", err)
+        },
+        Some(Duration::from_millis(1))   )
+    
+    
 }
