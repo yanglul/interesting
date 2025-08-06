@@ -72,7 +72,7 @@ pub fn packed<T: frame::audio::Sample>(frame: &frame::Audio) -> &[T] {
     if !frame.is_packed() {
         panic!("data is not packed");
     }
-
+    // println!(" frame {:?}, channel {:?}   ",frame.format(),frame.channels());
     if !<T as frame::audio::Sample>::is_valid(frame.format(), frame.channels()) {
         panic!("unsupported type");
     }
@@ -112,16 +112,25 @@ pub fn play_mp4(file:&String) -> Result<(), ffmpeg::Error> {
         stream_config.sample_rate().0
     )?;
     // A buffer to hold audio samples
-    let buffer = SharedRb::<Heap<_>>::new(8192);
-    let (mut producer, mut consumer) = buffer.split();
+    // let mut buffer: SharedRb<Heap<_>> ;
+    // let mut producer :Caching<Arc<SharedRb<Heap<_>>>, true, false>;
+    // let mut consumer :Caching<Arc<SharedRb<Heap<_>>>, false, true>;
     
+    let buffer= SharedRb::<Heap<u8>>::new(8192);
+    let (mut producer,consumer) = buffer.split();
+
+     
     // Set up the audio output stream
     let audio_stream = match stream_config.sample_format() {
-        SampleFormat::F32 => build_output_stream::<f32>(&device,&stream_config.into(),consumer),
+        SampleFormat::F32 => {
+            todo!(" generic transformate sample format suit ringbuff type ")
+        },
         SampleFormat::I16 => panic!("i16 output format unimplemented"),
         SampleFormat::U16 => panic!("u16 output format unimplemented"),
         SampleFormat::F64 => panic!("f64 output format unimplemented"),
-        SampleFormat::I8|SampleFormat::U8  =>build_output_stream::<i8>(&device,&stream_config.into(),consumer),
+        SampleFormat::I8|SampleFormat::U8 =>{
+            build_output_stream::<u8>(&device,&stream_config.into(),consumer)
+        },
         SampleFormat::I32 => panic!("I32 output format unimplemented"),
         SampleFormat::I64 => panic!("I64 output format unimplemented"),
         SampleFormat::U32 => panic!("U32 output format unimplemented"),
@@ -175,17 +184,14 @@ pub fn play_mp4(file:&String) -> Result<(), ffmpeg::Error> {
 }
 
 
-pub fn build_output_stream<T>(device:&cpal::Device,stream_config:&cpal::StreamConfig,mut consumer:Caching<Arc<SharedRb<Heap<f32>>>, false, true>)-> Result<cpal::Stream, BuildStreamError>
+pub fn build_output_stream<T>(device:&cpal::Device,stream_config:&cpal::StreamConfig,mut consumer:Caching<Arc<SharedRb<Heap<T>>>, false, true>)-> Result<cpal::Stream, BuildStreamError>
 where 
-    T: cpal::Sample{
-    
-        device.build_output_stream(stream_config.into(), move |data: &mut [f32], cbinfo| {
+    T: cpal::SizedSample  + cpal::SizedSample + Send + 'static{
+        device.build_output_stream(stream_config.into(), move |data, cbinfo| {
             // Copy to the audio buffer (if there aren't enough samples, write_audio will write silence)
             write_audio(data, &mut consumer, &cbinfo)
         }, |err| {
             eprintln!("error occurred on the audio output stream: {}", err)
         },
         Some(Duration::from_millis(1))   )
-    
-    
 }
